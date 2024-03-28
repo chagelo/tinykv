@@ -252,6 +252,9 @@ func newRaft(c *Config) *Raft {
 	if c.Applied > 0 {
 		raft.RaftLog.applied = c.Applied
 	}
+
+	raft.tick = raft.electionTiker
+
 	// error, because the hardstate may contain vote and lead info
 	// raft.becomeFollower(raft.Term, None)
 	return raft
@@ -386,7 +389,6 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// r.logger.Infof("[Peer %d Term %d], %v became follower", r.id, r.Term, r.State)
 	r.State = StateFollower
 	r.tick = r.electionTiker
-
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -856,10 +858,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request response
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Your Code Here (2A).
-	// TODO: ready to modify log related sign
-	if r.Lead != None {
-		r.logger.Infof("Notify, peer %d already has vote to a Leader %d", r.id, r.Lead)
-	}
 
 	r.Prs[m.From].Match = m.Commit
 	r.Prs[m.From].Next = m.Commit + 1
@@ -929,9 +927,10 @@ func (r *Raft) heartbeatTiker() {
 	r.electionElapsed++
 
 	if r.electionElapsed >= r.randomizedElectionTimeout {
-		r.logger.Infof("Error, in leader election timeout first that heartbeat")
 		r.electionElapsed = 0
-		panic("Maybe network error")
+		// r.logger.Infof("Error, in leader election timeout first that heartbeat")
+		// r.electionElapsed = 0
+		// panic("Maybe network error")
 	}
 
 	if r.State != StateLeader {

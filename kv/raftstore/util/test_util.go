@@ -1,7 +1,7 @@
 package util
 
 import (
-	"io/ioutil"
+	"os"
 
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
@@ -10,7 +10,7 @@ import (
 func NewTestEngines() *engine_util.Engines {
 	engines := new(engine_util.Engines)
 	var err error
-	engines.KvPath, err = ioutil.TempDir("", "tinykv_kv")
+	engines.KvPath, err = os.MkdirTemp("", "tinykv_kv")
 	if err != nil {
 		panic("create kv dir failed")
 	}
@@ -22,7 +22,7 @@ func NewTestEngines() *engine_util.Engines {
 	if err != nil {
 		panic("open kv db failed")
 	}
-	engines.RaftPath, err = ioutil.TempDir("", "tinykv_raft")
+	engines.RaftPath, err = os.MkdirTemp("", "tinykv_raft")
 	if err != nil {
 		panic("create raft dir failed")
 	}

@@ -201,6 +201,7 @@ type workers struct {
 }
 
 type Raftstore struct {
+	// 当前 store 的信息
 	ctx        *GlobalContext
 	storeState *storeState
 	router     *router
@@ -273,6 +274,8 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	router.sendStore(message.Msg{Type: message.MsgTypeStoreStart, Data: ctx.store})
 	for i := 0; i < len(peers); i++ {
 		regionID := peers[i].regionId
+		// 应该是启动 raftstore 的每个 peer
+		// 让每个 peer 参与进它们对应的 region 的活动中
 		_ = router.send(regionID, message.Msg{RegionID: regionID, Type: message.MsgTypeStart})
 	}
 	engines := ctx.engine

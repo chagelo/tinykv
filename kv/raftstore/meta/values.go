@@ -61,6 +61,7 @@ func InitRaftLocalState(raftEngine *badger.DB, region *metapb.Region) (*rspb.Raf
 			raftState.LastTerm = RaftInitLogTerm
 			raftState.HardState.Term = RaftInitLogTerm
 			raftState.HardState.Commit = RaftInitLogIndex
+			// why write this to raftengine
 			err = engine_util.PutMeta(raftEngine, RaftStateKey(region.Id), raftState)
 			if err != nil {
 				return raftState, err

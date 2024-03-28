@@ -34,6 +34,7 @@ type PeerStorage struct {
 	// current region information of the peer
 	region *metapb.Region
 	// current raft state of the peer
+	// 已经持久化的 index 和 term，hardstate 包含 commit 和 vote 以及当前 term
 	raftState *rspb.RaftLocalState
 	// current apply state of the peer
 	applyState *rspb.RaftApplyState
@@ -306,8 +307,43 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+// TODO(?): 这个函数做了什么
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+		// return errors.New("Empty log need to persist")
+	}
+
+	// persistFirstIndex := entries[0].Index
+	persistLastIndex := entries[len(entries)-1].Index
+
+	// storageFirstIndex == appliedIndex
+	// storageFirstIndex, _ := ps.FirstIndex()
+	// storageLastIndex = stabled Index
+	storageLastIndex, _ := ps.LastIndex()
+
+	// if persistFirstIndex < storageFirstIndex {
+	// 	panic("Impossible, given log is older than log in storage")
+	// }
+
+	// below, persisFirstIndex >= storageFirstIndex
+
+	for _, entry := range entries {
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), entry.Index), &entry); err != nil {
+			panic(err)
+		}
+	}
+
+	curLastIndex, curLastTerm := persistLastIndex, entries[len(entries)-1].Term
+	// 相当迷惑
+	// 可能是因为比如当前节点是 follower，持久化的日志也可能被覆盖掉
+	for index := curLastIndex + 1; index <= storageLastIndex; index++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), index))
+	}
+
+	// 这里很重要，不然 PeerStorage 的第一个测试 TestPeerStorageTerm 过不去
+	ps.raftState.LastIndex, ps.raftState.LastTerm = curLastIndex, curLastTerm
 	return nil
 }
 
@@ -331,7 +367,36 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+
+	raftWriteBatch := &engine_util.WriteBatch{}
+	kvWriteBatch := &engine_util.WriteBatch{}
+	var snapshotResult *ApplySnapResult = nil
+
+	// 
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		snapshotResult, _ = ps.ApplySnapshot(&ready.Snapshot, kvWriteBatch, raftWriteBatch)
+		kvWriteBatch.WriteToDB(ps.Engines.Raft)
+	}
+
+	// 持久化日志
+	if err := ps.Append(ready.Entries, raftWriteBatch); err != nil {
+		panic(err)
+	}
+
+	// 更新 raftlocalstate，包含 hardstate、lastindex、lastterm
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// 持久化 raftlocalstate
+	if err := raftWriteBatch.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState); err != nil {
+		panic(err)
+	}
+
+	// 避免二次调用，而 writebatch 未清空
+	raftWriteBatch.MustWriteToDB(ps.Engines.Raft)
+
+	return snapshotResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -74,11 +74,6 @@ func newLog(storage Storage) *RaftLog {
 		panic(err)
 	}
 
-	snapshot, err := storage.Snapshot()
-	if err != nil {
-		panic(err)
-	}
-
 	hardState, _, _ := storage.InitialState()
 
 	return &RaftLog{
@@ -88,7 +83,7 @@ func newLog(storage Storage) *RaftLog {
 		applied:         firstIndex - 1,
 		stabled:         lastIndex,
 		entries:         totalEntries,
-		pendingSnapshot: &snapshot,
+		pendingSnapshot: nil,
 	}
 }
 

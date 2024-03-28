@@ -244,7 +244,7 @@ func (rn *RawNode) HasReady() bool {
 // 应用层通知算法层，已经应用了最后一个 Ready
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
-	if IsEmptyHardState(rd.HardState) {
+	if !IsEmptyHardState(rd.HardState) {
 		rn.prevHardSt = rd.HardState
 	}
 
@@ -253,7 +253,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	if len(rd.CommittedEntries) > 0 {
-		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.Entries) - 1].Index
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries) - 1].Index
 	}
 
 	rn.Raft.RaftLog.maybeCompact()
