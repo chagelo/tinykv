@@ -280,14 +280,17 @@ func (r *Raft) sendSnapshot(to uint64) bool {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	if r.State != StateLeader {
-		return false
+		// return false
+		panic("Only leader can send Append msg")
 	}
 
+	// send snapshot
 	firstIndex := r.RaftLog.FirstIndex()
 	if r.Prs[to].Next < firstIndex {
 		return r.sendSnapshot(to)
 	}
 
+	// next > last index or < first index
 	term, err := r.RaftLog.Term(r.Prs[to].Next - 1)
 	if err != nil {
 		return r.sendSnapshot(to)
@@ -355,11 +358,11 @@ func (r *Raft) resetRandomizedElectionTimeout() {
 }
 
 func (r *Raft) reset(term uint64) {
-	if r.Term != term {
-		r.Term = term
-		r.Vote = None
+	if r.Term > term {
+		panic("Can not reset to smaller term")
 	}
 
+	r.Term = term
 	r.Lead = None
 
 	r.electionElapsed = 0
@@ -446,20 +449,37 @@ func (r *Raft) becomeLeader() {
 
 func stepFollower(r *Raft, m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgHeartbeat:
-		r.electionElapsed = 0
-		r.Lead = m.From
-		r.handleHeartbeat(m)
+	case pb.MessageType_MsgHup:
+		r.startElection()
+
 	case pb.MessageType_MsgAppend:
-		r.electionElapsed = 0
-		r.Lead = m.From
 		r.handleAppendEntries(m)
+
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
+
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
 	}
 	return nil
 }
 
 func stepCandidate(r *Raft, m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.startElection()
+
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
+		r.handleAppendEntries(m)
+
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
+		r.handleHeartbeat(m)
+
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVoteResponse(m)
 	}
@@ -470,10 +490,36 @@ func stepLeader(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
+
+	case pb.MessageType_MsgPropose:
+		// MsgPropose with empty entries
+		if len(m.Entries) == 0 {
+			r.logger.Panicf("%x stepped empty MsgPropose", r.id)
+		}
+
+		// If we are not currently a member of the range (i.e. this node
+		// was removed from the configuration while serving as leader),
+		// drop any new proposals.
+		if r.Prs[r.id] == nil {
+			return ErrProposalDropped
+		}
+
+		r.handlePropose(m)
+
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendEntriesResponse(m)
+
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
-	case pb.MessageType_MsgAppendResponse:
-		r.bcastAppend()
+
+	case pb.MessageType_MsgRequestVote:
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Reject:  true,
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+		})
 	}
 	return nil
 }
@@ -484,7 +530,7 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch {
 	case m.Term == 0:
-
+		// local message
 	case m.Term > r.Term:
 		// Already vote to others, but receive a message from another candidate
 		// if m.MsgType == pb.MessageType_MsgRequestVote {
@@ -520,61 +566,8 @@ func (r *Raft) Step(m pb.Message) error {
 		return nil
 	}
 
-	switch r.State {
-	case StateFollower:
-		if m.MsgType == pb.MessageType_MsgHup {
-			r.startElection()
-		}
-		if m.MsgType == pb.MessageType_MsgAppend {
-			r.handleAppendEntries(m)
-		}
-		if m.MsgType == pb.MessageType_MsgHeartbeat {
-			r.handleHeartbeat(m)
-		}
-		if m.MsgType == pb.MessageType_MsgRequestVote {
-			r.handleRequestVote(m)
-		}
-	case StateCandidate:
-		if m.MsgType == pb.MessageType_MsgHup {
-			r.startElection()
-		}
-		if m.MsgType == pb.MessageType_MsgAppend {
-			r.handleAppendEntries(m)
-		}
-		if m.MsgType == pb.MessageType_MsgHeartbeat {
-			r.handleHeartbeat(m)
-		}
-		if m.MsgType == pb.MessageType_MsgRequestVote {
-			r.handleRequestVote(m)
-		}
-		if m.MsgType == pb.MessageType_MsgRequestVoteResponse {
-			r.handleRequestVoteResponse(m)
-		}
-	case StateLeader:
-		if m.MsgType == pb.MessageType_MsgBeat {
-			r.bcastHeartbeat()
-		}
-		if m.MsgType == pb.MessageType_MsgPropose {
-			r.handlePropose(m)
-		}
-		if m.MsgType == pb.MessageType_MsgAppendResponse {
-			r.handleAppendEntriesResponse(m)
-		}
-		if m.MsgType == pb.MessageType_MsgHeartbeatResponse {
-			r.handleHeartbeatResponse(m)
-		}
-		if m.MsgType == pb.MessageType_MsgRequestVote {
-			r.msgs = append(r.msgs, pb.Message{
-				From:    r.id,
-				To:      m.From,
-				Term:    r.Term,
-				Reject:  true,
-				MsgType: pb.MessageType_MsgRequestVoteResponse,
-			})
-		}
-	}
-
-	return nil
+	err := r.step(r, m)
+	return err
 }
 
 // r.state must be Follower or Candidate
@@ -619,15 +612,18 @@ func (r *Raft) handlePropose(m pb.Message) {
 			Term:      r.Term,
 			Index:     r.RaftLog.LastIndex() + 1,
 			Data:      e.Data,
-			EntryType: e.EntryType,
+			EntryType: e.EntryType, // EntryType is confchange or normal
 		}
 
 		r.RaftLog.entries = append(r.RaftLog.entries, entry)
-		r.Prs[r.id].Match = r.RaftLog.LastIndex()
-		r.Prs[r.id].Next = r.Prs[r.id].Match + 1
-		if len(r.Prs) == 1 {
-			r.RaftLog.committed++
-		}
+
+		// BUG: do not update log replicate progress of other node
+		// until receive the append response
+		// r.Prs[r.id].Match = r.RaftLog.LastIndex()
+		// r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+		// if len(r.Prs) == 1 {
+		// 	r.RaftLog.committed++
+		// }
 	}
 	r.bcastAppend()
 }
@@ -883,9 +879,9 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 
 	if len(r.RaftLog.entries) > 0 {
 		if meta.Index > r.RaftLog.LastIndex() {
-			r.RaftLog.entries = nil;
+			r.RaftLog.entries = nil
 		} else if meta.Index >= r.RaftLog.FirstIndex() {
-			r.RaftLog.entries = r.RaftLog.entries[meta.Index - r.RaftLog.FirstIndex():]
+			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.FirstIndex():]
 		}
 	}
 
@@ -909,7 +905,7 @@ func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 }
 
-// current peer is candidate
+// current peer is candidate or follower
 func (r *Raft) electionTiker() {
 	r.electionElapsed++
 

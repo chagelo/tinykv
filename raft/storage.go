@@ -258,11 +258,18 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 		entries = entries[first-entries[0].Index:]
 	}
 
+	// offset must >= 0
 	offset := entries[0].Index - ms.ents[0].Index
 	switch {
+	// ms[0].index <= entries[0].index < ms last entris index
+	// |-- ms entries --|
+	//          |-- appended entries --|
 	case uint64(len(ms.ents)) > offset:
 		ms.ents = append([]pb.Entry{}, ms.ents[:offset]...)
 		ms.ents = append(ms.ents, entries...)
+	// new appended entries's index just equals to the last storage entris's index + 1
+	// |-- ms entries --|
+	//          		|-- appended entries --|
 	case uint64(len(ms.ents)) == offset:
 		ms.ents = append(ms.ents, entries...)
 	default:
