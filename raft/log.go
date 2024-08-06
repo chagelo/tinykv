@@ -99,34 +99,11 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-
-	ents := []pb.Entry{}
-
-	firstIndex, err := l.storage.FirstIndex()
-	if err != nil {
-		panic(err)
-	}
-	lastIndex, err := l.storage.LastIndex()
-	if err != nil {
-		panic(err)
+	if len(l.entries) == 0 {
+		return []pb.Entry{}
 	}
 
-	if firstIndex <= lastIndex && firstIndex <= l.stabled+1 {
-		ents, err = l.storage.Entries(firstIndex, l.stabled+1)
-	}
-
-	if err != nil {
-		panic(err)
-	}
-
-	if len(l.entries) > 0 {
-		for _, entry := range l.entries {
-			if entry.Index > l.stabled {
-				ents = append(ents, entry)
-			}
-		}
-	}
-	return ents
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
@@ -235,10 +212,9 @@ func (l *RaftLog) findConflict(ents []*pb.Entry) uint64 {
 	return 0
 }
 
-
 // Only be called in StateLeader.
 func (l *RaftLog) maybeCommit(commitIndex, commitTerm uint64) bool {
-	if (commitIndex != 0 && commitIndex > l.committed && l.matchTerm(commitIndex, commitTerm)) {
+	if commitIndex != 0 && commitIndex > l.committed && l.matchTerm(commitIndex, commitTerm) {
 		l.committed = commitIndex
 		return true
 	}

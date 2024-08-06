@@ -235,6 +235,7 @@ func newRaft(c *Config) *Raft {
 		Term:    state.Term,
 		Vote:    state.Vote,
 		State:   StateFollower,
+		Lead:    None,
 		RaftLog: raftlog,
 
 		Prs:              make(map[uint64]*Progress),
@@ -242,6 +243,7 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
 		logger:           c.Logger,
+		step:             stepFollower,
 	}
 
 	lastIndex := raft.RaftLog.LastIndex()
@@ -431,7 +433,7 @@ func (r *Raft) becomeLeader() {
 	lastIndex := r.RaftLog.LastIndex()
 	for peer := range r.Prs {
 		r.Prs[peer].Next = lastIndex + 1
-		r.Prs[peer].Match = 0
+		r.Prs[peer].Match = lastIndex
 	}
 
 	// noop entry?
@@ -629,8 +631,18 @@ func (r *Raft) handlePropose(m pb.Message) {
 		// r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 	}
 
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+
 	if len(r.Prs) == 1 {
 		r.RaftLog.committed += uint64(len(m.Entries))
+
+		if r.RaftLog.committed > r.Prs[r.id].Match {
+			r.Prs[r.id].Match = r.RaftLog.committed
+			r.Prs[r.id].Next = r.RaftLog.committed + 1
+
+		}
+
 		return
 	}
 
@@ -688,7 +700,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 
-	if r.Lead != m.From {
+	if r.Lead != None && r.Lead != m.From {
 		r.logger.Infof("[Peer %d term: %d], Received a %s message from another Leader with [Peer %d term: %d]", r.id, r.Term, m.MsgType, m.From, m.Term)
 		panic("")
 	}
@@ -723,61 +735,29 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if term == m.LogTerm {
 		if len(m.Entries) != 0 {
 
-			// m.Index + 1 = m.Entries[0].Index
-			firstIndex := r.RaftLog.FirstIndex()
-			offset := m.Index + 1 - firstIndex
-			entries_firstIndex := m.Entries[0].Index
-			entries_lastIndex := m.Entries[len(m.Entries) - 1].Index
+			for _, en := range m.Entries {
+				index := en.Index
+				oldTerm, err := r.RaftLog.Term(index)
+				if index-r.RaftLog.FirstIndex() > uint64(len(r.RaftLog.entries)) || index > r.RaftLog.LastIndex() {
+					r.RaftLog.entries = append(r.RaftLog.entries, *en)
+				} else if oldTerm != en.Term || err != nil {
+					// 不匹配，删除从此往后的所有条目
+					if index < r.RaftLog.FirstIndex() {
+						r.RaftLog.entries = make([]pb.Entry, 0)
+					} else {
+						r.RaftLog.entries = r.RaftLog.entries[0 : index-r.RaftLog.FirstIndex()]
+					}
+					// 更新stable
+					r.RaftLog.stabled = min(r.RaftLog.stabled, index-1)
+					// 追加新条目
+					r.RaftLog.entries = append(r.RaftLog.entries, *en)
 
-			msg_ri := min(r.RaftLog.LastIndex(), entries_lastIndex) - entries_firstIndex + 1
-
-			for idx, entry := range m.Entries[:msg_ri] {
-				r.RaftLog.entries[offset+uint64(idx)] = *entry
-				r.RaftLog.stabled = entry.Index
-			}
-
-			lastIndex := r.RaftLog.LastIndex()
-			r.RaftLog.stabled = lastIndex
-
-			if entries_lastIndex > lastIndex {
-				for _, entry := range m.Entries[lastIndex+1-entries_firstIndex:] {
-					r.RaftLog.entries = append(r.RaftLog.entries, *entry)
-					r.RaftLog.stabled = entry.Index
 				}
 			}
+
 		}
-		// for _, entry := range m.Entries {
 
-		// 	lastIndex := r.RaftLog.LastIndex()
-
-		// 	if entry.Index <= lastIndex {
-		// 		//PreTerm, err = r.RaftLog.Term(entry.Index)
-
-		// 		Term, _ := r.RaftLog.Term(entry.Index)
-		// 		//删除index相同但是term不同的日志 并且更改stabled
-		// 		if Term != entry.Term {
-		// 			firstIndex := r.RaftLog.FirstIndex()
-		// 			//截断
-		// 			// if len(r.RaftLog.entries) != 0 && int64(m.Index-firstIndex+1) >= 0 {
-		// 			// 	r.RaftLog.entries = r.RaftLog.entries[0 : m.Index-firstIndex+1]
-		// 			// }
-		// 			if len(r.RaftLog.entries) != 0 && int64(entry.Index-firstIndex) >= 0 {
-		// 				r.RaftLog.entries = r.RaftLog.entries[0 : entry.Index-firstIndex]
-		// 			}
-
-		// 			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
-		// 			r.RaftLog.stabled = m.Index
-		// 		}
-		// 	} else {
-		// 		// 超出了节点匹配的日志
-		// 		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
-
-		// 	}
-
-		// }
-
-		// maybe message contain empty entry
-		// errors: lastIndex := r.RaftLog.LastIndex()
+		// r.RaftLog.stabled = m.Entries[0].Index - 1
 
 		lastIndex := m.Index + uint64(len(m.Entries))
 		// m.Commit equals to Leader's commitIndex
@@ -849,9 +829,15 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			// it applies the entry to its local state machine (in log order).
 			// Reference: section 5.3
 			// FIXME:r.RaftLog.storage.apply
-			r.RaftLog.storage
+
 			r.RaftLog.committed = matchInts[(len(matchInts)+1)/2-1]
-			// FIXME: if this needed
+
+			if r.RaftLog.committed > r.Prs[r.id].Match {
+				r.Prs[r.id].Match = r.RaftLog.committed
+				r.Prs[r.id].Next = r.RaftLog.committed + 1
+			}
+
+			// it's necessary to broadcast to everyone else
 			r.bcastAppend()
 		}
 	}
