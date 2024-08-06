@@ -171,7 +171,7 @@ func (l *RaftLog) LastIndex() uint64 {
 
 }
 
-// stable snapshot|stable entries|unstable snapshot|unstable entries
+//  apply|commited entries|stable entries|unstable entries
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
