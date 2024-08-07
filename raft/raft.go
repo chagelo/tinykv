@@ -274,7 +274,28 @@ func (r *Raft) bcastAppend() {
 }
 
 func (r *Raft) sendSnapshot(to uint64) bool {
-	return false
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot // 挂起的还未处理的快照
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot() // 生成一份快照
+	}
+
+	if err != nil {
+		return false
+	}
+
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+		To:       to,
+		From:     r.id,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	return true
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -300,10 +321,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	entries := make([]*pb.Entry, 0)
 
-	for i := 0; i < len(r.RaftLog.entries); i++ {
-		if r.Prs[to].Next <= r.RaftLog.entries[i].Index {
-			entries = append(entries, &r.RaftLog.entries[i])
-		}
+	for i := r.Prs[to].Next; i <= r.RaftLog.LastIndex(); i++ {
+		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
 	}
 
 	msg := pb.Message{
@@ -456,13 +475,22 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.startElection()
 
 	case pb.MessageType_MsgAppend:
+		r.Lead = m.From
+		r.electionElapsed = 0
 		r.handleAppendEntries(m)
 
 	case pb.MessageType_MsgHeartbeat:
+		r.electionElapsed = 0
+		r.Lead = m.From
 		r.handleHeartbeat(m)
 
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
+
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -701,12 +729,15 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	if r.Lead != None && r.Lead != m.From {
-		r.logger.Infof("[Peer %d term: %d], Received a %s message from another Leader with [Peer %d term: %d]", r.id, r.Term, m.MsgType, m.From, m.Term)
-		panic("")
+		r.logger.Panicf("[Peer %d term: %d], Received a %s message from another Leader with [Peer %d term: %d]", r.id, r.Term, m.MsgType, m.From, m.Term)
 	}
 	if r.State != StateFollower {
-		r.logger.Infof("[Peer %d term: %d], Received a %s message from Leader with [Peer %d term: %d], but current state is %s", r.id, r.Term, m.MsgType, m.From, m.Term, r.State)
-		panic("")
+		r.logger.Panicf("[Peer %d term: %d], Received a %s message from Leader with [Peer %d term: %d], but current state is %s", r.id, r.Term, m.MsgType, m.From, m.Term, r.State)
+	}
+
+	// m.Index + 1 may not equal m.Entries[0].Index in some corner testcase
+	if len(m.Entries) > 0 && m.Index+1 != m.Entries[0].Index {
+		r.logger.Panicf("[Peer %d term: %d], Received a %s, however index of first entry is not equal to m.Index minus 1", r.id, r.Term, m.MsgType)
 	}
 
 	// m.LogTerm, m.Index 是 leader 中当前 follower progress
@@ -729,9 +760,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 截断
 	// |--- raftlog ---|
 	// 			|--- msg ---|
+
 	// |--- raftlog ---|
 	// 		|- msg -|
 
+	// Hint: it's impossible that m.Index != m.Entries[0].Index
 	if term == m.LogTerm {
 		if len(m.Entries) != 0 {
 
@@ -859,9 +892,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.logger.Infof("Notify, peer %d already has vote to a Leader %d", r.id, r.Lead)
 	}
 
-	r.State = StateFollower
-	r.electionElapsed = 0
-
 	r.msgs = append(r.msgs, pb.Message{
 		From:    r.id,
 		To:      m.From,
@@ -876,8 +906,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Your Code Here (2A).
 
-	r.Prs[m.From].Match = m.Commit
-	r.Prs[m.From].Next = m.Commit + 1
 	if m.Commit < r.RaftLog.committed {
 		r.sendAppend(m.From)
 	}
@@ -890,6 +918,10 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 
 	if meta.Index <= r.RaftLog.committed {
 		return
+	}
+
+	if meta.Index+1 < r.RaftLog.FirstIndex() {
+		r.logger.Panicf("[Peer %d term: %d], receive %s message from %x [term: %d] snapshot lastIndex + 1 < raftlog firstIndex", r.id, r.Term, m.MsgType, m.From, m.Term)
 	}
 
 	r.Lead = m.From

@@ -203,6 +203,16 @@ func (l *RaftLog) matchTerm(idx, term uint64) bool {
 	return targeTerm == term
 }
 
+// findConflict finds the index of the conflict.
+// It returns the first pair of conflicting entries between the existing
+// entries and the given entries, if there are any.
+// If there is no conflicting entries, and the existing entries contains
+// all the given entries, zero will be returned.
+// If there is no conflicting entries, but the given entries contains new
+// entries, the index of the first new entry will be returned.
+// An entry is considered to be conflicting if it has the same index but
+// a different term.
+// The index of the given entries MUST be continuously increasing.
 func (l *RaftLog) findConflict(ents []*pb.Entry) uint64 {
 	for i := range ents {
 		if !l.matchTerm(ents[i].Index, ents[i].Term) {
@@ -236,4 +246,11 @@ func (l *RaftLog) isMoreUptoDate(candidateIndex, candidateTerm uint64) bool {
 		return candidateTerm > lastTerm
 	}
 	return candidateIndex >= lastIndex
+}
+
+
+func (l *RaftLog) commitTo(tocommit uint64) {
+	if l.committed < tocommit {
+		l.committed = tocommit
+	}
 }
