@@ -930,6 +930,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.stabled = m.Snapshot.Metadata.Index
 	r.Term = m.Term
 
+
+	// condition 1:
+	// |---- entry ---|
+	//|------ snapshot -----|
+	//  condition 2:
+	// |------- entry -------|
+	//|---- snapshot ----|
 	if len(r.RaftLog.entries) > 0 {
 		if meta.Index > r.RaftLog.LastIndex() {
 			r.RaftLog.entries = nil
@@ -946,6 +953,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	}
 
 	r.RaftLog.pendingSnapshot = m.Snapshot
+
+
+	// FIXME: reply MsgAppendResponse 
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+
+	})
 }
 
 // addNode add a new node to raft group

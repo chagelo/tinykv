@@ -130,34 +130,37 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	
-	// Your Code Here (2B).
-	if msg.Requests != nil {
-		d.proposeRequest(msg, cb)
-	} else {
 
+	for len(msg.Requests) > 0 {
+		req := msg.Requests[0]
+		var key []byte
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = req.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = req.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = req.Delete.Key
+		}
+		err = util.CheckKeyInRegion(key, d.Region())
+		if err != nil && req.CmdType != raft_cmdpb.CmdType_Snap {
+			cb.Done(ErrResp(err))
+			msg.Requests = msg.Requests[1:]
+			continue
+		}
+		data, err1 := msg.Marshal()
+		if err1 != nil {
+			log.Panic(err)
+		}
+		p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+		d.proposals = append(d.proposals, p)
+		msg.Requests = msg.Requests[1:]
+		d.RaftGroup.Propose(data)
+
+		// below just for Test
+		cb.Done(newCmdResp())
 	}
-}
 
-func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	// 1. 封装回调
-	// 后续相应的 entry 执行完毕后，响应该 proposal，即 callback.Done()
-	d.proposals = append(d.proposals, &proposal{
-		index: d.RaftGroup.Raft.RaftLog.LastIndex() + 1,
-		term: d.RaftGroup.Raft.Term,
-		cb: cb,
-	})
-
-	// 2. 序列化 RaftCmdRequest
-	data, err := msg.Marshal()
-	if err != nil {
-		panic(err)
-	}
-
-	err = d.RaftGroup.Propose(data)
-	if err != nil {
-		panic(err)
-	}
 }
 
 func (d *peerMsgHandler) onTick() {

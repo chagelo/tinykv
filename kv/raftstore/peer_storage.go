@@ -54,6 +54,7 @@ type PeerStorage struct {
 // NewPeerStorage get the persist raftState from engines and return a peer storage
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
+	// raft engine 包含当前 node 里所有 peer 的 metadata
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
 	if err != nil {
 		return nil, err
@@ -307,7 +308,7 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
-// TODO(?): 这个函数做了什么
+// Hint: 看 raft/storage.go 中的 Append 函數
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	if len(entries) == 0 {
@@ -317,17 +318,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 	// persistFirstIndex := entries[0].Index
 	persistLastIndex := entries[len(entries)-1].Index
-
-	// storageFirstIndex == appliedIndex
-	// storageFirstIndex, _ := ps.FirstIndex()
-	// storageLastIndex = stabled Index
 	storageLastIndex, _ := ps.LastIndex()
-
-	// if persistFirstIndex < storageFirstIndex {
-	// 	panic("Impossible, given log is older than log in storage")
-	// }
-
-	// below, persisFirstIndex >= storageFirstIndex
 
 	for _, entry := range entries {
 		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), entry.Index), &entry); err != nil {
@@ -359,7 +350,52 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			log.Panic(err)
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+
+	ps.raftState.LastIndex = snapshot.Metadata.GetIndex()
+	ps.raftState.LastTerm = snapshot.Metadata.GetTerm()
+	ps.applyState.AppliedIndex = snapshot.Metadata.GetIndex()
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.GetIndex()
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.GetTerm()
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.GetRegion().GetId()), ps.applyState); err != nil {
+		log.Panic(err)
+	}
+
+	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)
+
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.GetRegion().GetId()), ps.raftState); err != nil {
+		log.Panic(err)
+	}
+
+	ch := make(chan bool, 1)
+
+	ps.regionSched <- &runner.RegionTaskApply {
+		RegionId: snapData.GetRegion().GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.GetMetadata(),
+		StartKey: snapData.GetRegion().GetStartKey(),
+		EndKey: snapData.GetRegion().GetEndKey(),
+	}
+	
+	if !(<-ch) {
+		return nil, nil
+	}
+	
+	ApplySnapResult := &ApplySnapResult{
+		PrevRegion: ps.Region(),
+		Region: snapData.GetRegion(),
+	}
+	
+	return ApplySnapResult, nil
 }
 
 // Save memory states to disk.
@@ -372,7 +408,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	kvWriteBatch := &engine_util.WriteBatch{}
 	var snapshotResult *ApplySnapResult = nil
 
-	// 
+	// 应用快照
 	if !raft.IsEmptySnap(&ready.Snapshot) {
 		snapshotResult, _ = ps.ApplySnapshot(&ready.Snapshot, kvWriteBatch, raftWriteBatch)
 		kvWriteBatch.WriteToDB(ps.Engines.Raft)
