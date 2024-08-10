@@ -396,10 +396,6 @@ func (r *Raft) resetVotes() {
 	r.Vote = None
 }
 
-func (r *Raft) resetPrs() {
-
-}
-
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
@@ -740,95 +736,93 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.logger.Panicf("[Peer %d term: %d], Received a %s, however index of first entry is not equal to m.Index minus 1", r.id, r.Term, m.MsgType)
 	}
 
-	// m.LogTerm, m.Index 是 leader 中当前 follower progress
-	// 的匹配的最后一条日志的 term 和 index
-	term, err := r.RaftLog.Term(m.Index)
-	if err != nil {
-		// 比如当前节点日志很久，很多日志都没有
-		// 告知 leader，当前节点的最大日志 id
+	if m.Index < r.RaftLog.committed {
 		r.msgs = append(r.msgs, pb.Message{
 			From:    r.id,
 			To:      m.From,
-			Term:    r.Term,
+			MsgType: pb.MessageType_MsgAppendResponse,
 			Index:   r.RaftLog.committed,
+			Term:    r.Term,
 			Reject:  true,
-			MsgType: pb.MessageType_MsgAppendResponse,
 		})
 		return
 	}
 
-	// 截断
-	// |--- raftlog ---|
-	// 			|--- msg ---|
-
-	// |--- raftlog ---|
-	// 		|- msg -|
-
-	// Hint: it's impossible that m.Index != m.Entries[0].Index
-	if term == m.LogTerm {
-		if len(m.Entries) != 0 {
-
-			for _, en := range m.Entries {
-				index := en.Index
-				oldTerm, err := r.RaftLog.Term(index)
-				if index-r.RaftLog.FirstIndex() > uint64(len(r.RaftLog.entries)) || index > r.RaftLog.LastIndex() {
-					r.RaftLog.entries = append(r.RaftLog.entries, *en)
-				} else if oldTerm != en.Term || err != nil {
-					// 不匹配，删除从此往后的所有条目
-					if index < r.RaftLog.FirstIndex() {
-						r.RaftLog.entries = make([]pb.Entry, 0)
-					} else {
-						r.RaftLog.entries = r.RaftLog.entries[0 : index-r.RaftLog.FirstIndex()]
-					}
-					// 更新stable
-					r.RaftLog.stabled = min(r.RaftLog.stabled, index-1)
-					// 追加新条目
-					r.RaftLog.entries = append(r.RaftLog.entries, *en)
-
-				}
-			}
-
-		}
-
-		// r.RaftLog.stabled = m.Entries[0].Index - 1
-
-		lastIndex := m.Index + uint64(len(m.Entries))
-		// m.Commit equals to Leader's commitIndex
-		r.RaftLog.committed = min(lastIndex, m.Commit)
-
+	// 和 m.Index, m.LogTerm 都不匹配
+	if !r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+		hintIndex := min(m.Index, r.RaftLog.LastIndex())
+		hintIndex, hintTerm := r.RaftLog.findConflictByTerm(hintIndex, m.LogTerm)
 		r.msgs = append(r.msgs, pb.Message{
 			From:    r.id,
 			To:      m.From,
+			Index:   hintIndex,
 			Term:    r.Term,
-			Index:   lastIndex,
+			Reject:  true,
+			LogTerm: hintTerm,
 			MsgType: pb.MessageType_MsgAppendResponse,
 		})
 		return
 	}
 
-	matchedIdx := m.Index
-	for ; ; matchedIdx-- {
-		if matchedIdx <= 0 {
-			break
+	// 此时算一个特殊情况，raftlog 为空，但 m.entries 不为空
+	if len(r.RaftLog.entries) == 0 {
+		for _, entry := range m.Entries {
+			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		}
-		newterm, err := r.RaftLog.Term(matchedIdx)
-		if err != nil {
-			panic(err)
-		}
-		if newterm != term {
-			break
-		}
+		lastIndex := m.Entries[len(m.Entries)-1].Index
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   lastIndex,
+			Term:    r.Term,
+		})
+		r.RaftLog.commitTo(min(m.Commit, lastIndex), r)
+		return
 	}
 
+	// 和 m.Index 和 m.LogTerm 是能 match 上
+	lastnewi := m.Index + uint64(len(m.Entries))
+	// ci 开始 match 不上, ci 有可能是 m.Index + 1，刚好在 m.Index 的下一个位置 match不上
+	// 又可能为 0，表示没有冲突
+	ci := r.RaftLog.findConflict(m.Entries)
+
+	switch {
+	case ci == 0:
+	case ci <= r.RaftLog.committed:
+		r.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, r.RaftLog.committed)
+	default:
+		// |-raftlog---|
+		//         |---entries---|
+		offset := m.Index + 1
+		idx := ci - offset
+		if idx > uint64(len(m.Entries)) {
+			r.logger.Panicf("index, %d, is out of range [%d]", ci-offset, len(m.Entries))
+		}
+
+		if len(m.Entries[idx:]) == 0 {
+			break
+		}
+
+		if after := m.Entries[idx].Index - 1; after < r.RaftLog.committed {
+			r.logger.Panicf("after(%d) is out of range [committed(%d)]", after, r.RaftLog.committed)
+		}
+		ents := append([]pb.Entry{}, r.RaftLog.entries[:ci-r.RaftLog.FirstIndex()]...)
+
+		for _, entry := range m.Entries[idx:] {
+			ents = append(ents, *entry)
+		}
+		r.RaftLog.entries = ents
+		r.RaftLog.stabled = min(r.RaftLog.stabled, ci-1)
+	}
+	r.RaftLog.commitTo(min(m.Commit, lastnewi), r)
 	r.msgs = append(r.msgs, pb.Message{
 		From:    r.id,
 		To:      m.From,
-		Term:    r.Term,
-		Index:   matchedIdx,
-		Reject:  true,
 		MsgType: pb.MessageType_MsgAppendResponse,
+		Index:   lastnewi,
+		Term:    r.Term,
 	})
-
 }
 
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
@@ -849,7 +843,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		}
 
 		sort.Slice(matchInts, func(i, j int) bool {
-			return matchInts[i] > matchInts[j]
+			return matchInts[i] < matchInts[j]
 		})
 
 		// desc order,
@@ -857,13 +851,11 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		// [1, 2, 3, cur] 3 -> 2 -> 1
 
 		// 具有当前日志的 term 被写到大多数节点
-		if r.RaftLog.maybeCommit(matchInts[(len(matchInts)+1)/2-1], r.Term) {
+		if r.RaftLog.maybeCommit(matchInts[len(matchInts)/2], r.Term) {
 			// once a follower learns that a log entry is committed,
 			// it applies the entry to its local state machine (in log order).
 			// Reference: section 5.3
 			// FIXME:r.RaftLog.storage.apply
-
-			r.RaftLog.committed = matchInts[(len(matchInts)+1)/2-1]
 
 			if r.RaftLog.committed > r.Prs[r.id].Match {
 				r.Prs[r.id].Match = r.RaftLog.committed
@@ -930,7 +922,6 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.stabled = m.Snapshot.Metadata.Index
 	r.Term = m.Term
 
-
 	// condition 1:
 	// |---- entry ---|
 	//|------ snapshot -----|
@@ -954,11 +945,9 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 
 	r.RaftLog.pendingSnapshot = m.Snapshot
 
-
-	// FIXME: reply MsgAppendResponse 
+	// FIXME: reply MsgAppendResponse
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
-
 	})
 }
 

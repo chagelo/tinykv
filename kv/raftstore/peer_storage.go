@@ -132,9 +132,12 @@ func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	if idx == ps.truncatedIndex() {
 		return ps.truncatedTerm(), nil
 	}
+	// exclude idx < ps.truncatedIndex && idx > ps.raftSate.LastIndex
 	if err := ps.checkRange(idx, idx+1); err != nil {
 		return 0, err
 	}
+	// it means the entries has the same index
+	//  or idx is exactly equal to b
 	if ps.truncatedTerm() == ps.raftState.LastTerm || idx == ps.raftState.LastIndex {
 		return ps.raftState.LastTerm, nil
 	}
@@ -308,33 +311,57 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+// Append unstable entries to storage
 // Hint: 看 raft/storage.go 中的 Append 函數
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	if len(entries) == 0 {
 		return nil
-		// return errors.New("Empty log need to persist")
 	}
 
 	// persistFirstIndex := entries[0].Index
-	persistLastIndex := entries[len(entries)-1].Index
-	storageLastIndex, _ := ps.LastIndex()
+	entLastIndex := entries[len(entries)-1].Index
+	entLastTerm := entries[len(entries)-1].Term
+	entFirstIndex := entries[0].Index
 
+	storageLastIndex, _ := ps.LastIndex()
+	storageFirstIndex, _ := ps.FirstIndex()
+
+	if entLastIndex < storageFirstIndex {
+		return nil
+	}
+
+	//                |---entry---|
+	//|----storage---|
+	// 当 advance 推进整个 RawNode 时，确实一定满足这个条件
+	// advance 会更新 raft 的 applyIndex，stableIndex，清空 msg
+	// 丢弃被压缩的日志，清空 pendingSnapshot
+	// if storageLastIndex+1 < entFirstIndex {
+	// 	panic("Appended entries are not continuous with stable storage")
+	// }
+
+	// stable storage does not mean the entry is commited,
+	// so with new append entry, we just overwrite
+	// |---entry---|
+	//         |----storage---|
+	if entFirstIndex < storageFirstIndex {
+		entries = entries[storageFirstIndex-entFirstIndex:]
+	}
 	for _, entry := range entries {
 		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.GetId(), entry.Index), &entry); err != nil {
-			panic(err)
+			return err
 		}
 	}
 
-	curLastIndex, curLastTerm := persistLastIndex, entries[len(entries)-1].Term
-	// 相当迷惑
-	// 可能是因为比如当前节点是 follower，持久化的日志也可能被覆盖掉
-	for index := curLastIndex + 1; index <= storageLastIndex; index++ {
+	// func Append receive total unstable entries
+	// so, entries which has index within [entLastIndex+1, storageLastIndex]
+	// might be overwirte due to Log Replication
+	for index := entLastIndex + 1; index <= storageLastIndex; index++ {
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), index))
 	}
 
-	// 这里很重要，不然 PeerStorage 的第一个测试 TestPeerStorageTerm 过不去
-	ps.raftState.LastIndex, ps.raftState.LastTerm = curLastIndex, curLastTerm
+	// update RaftLocalSate
+	ps.raftState.LastIndex, ps.raftState.LastTerm = entFirstIndex, entLastTerm
 	return nil
 }
 
@@ -358,7 +385,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		ps.clearExtraData(snapData.Region)
 	}
 
-
 	ps.raftState.LastIndex = snapshot.Metadata.GetIndex()
 	ps.raftState.LastTerm = snapshot.Metadata.GetTerm()
 	ps.applyState.AppliedIndex = snapshot.Metadata.GetIndex()
@@ -378,23 +404,23 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 	ch := make(chan bool, 1)
 
-	ps.regionSched <- &runner.RegionTaskApply {
+	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: snapData.GetRegion().GetId(),
 		Notifier: ch,
 		SnapMeta: snapshot.GetMetadata(),
 		StartKey: snapData.GetRegion().GetStartKey(),
-		EndKey: snapData.GetRegion().GetEndKey(),
+		EndKey:   snapData.GetRegion().GetEndKey(),
 	}
-	
+
 	if !(<-ch) {
 		return nil, nil
 	}
-	
+
 	ApplySnapResult := &ApplySnapResult{
 		PrevRegion: ps.Region(),
-		Region: snapData.GetRegion(),
+		Region:     snapData.GetRegion(),
 	}
-	
+
 	return ApplySnapResult, nil
 }
 
@@ -411,10 +437,11 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// 应用快照
 	if !raft.IsEmptySnap(&ready.Snapshot) {
 		snapshotResult, _ = ps.ApplySnapshot(&ready.Snapshot, kvWriteBatch, raftWriteBatch)
-		kvWriteBatch.WriteToDB(ps.Engines.Raft)
+		log.Infof("%v-%v-------%v-%v\n", snapshotResult.PrevRegion.StartKey, snapshotResult.PrevRegion.EndKey, snapshotResult.Region.StartKey, snapshotResult.Region.EndKey)
 	}
 
 	// 持久化日志
+	// update raftstate.LastIndex, LastTerm
 	if err := ps.Append(ready.Entries, raftWriteBatch); err != nil {
 		panic(err)
 	}
@@ -430,8 +457,8 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 
 	// 避免二次调用，而 writebatch 未清空
-	raftWriteBatch.MustWriteToDB(ps.Engines.Raft)
-
+	raftWriteBatch.WriteToDB(ps.Engines.Raft)
+	kvWriteBatch.WriteToDB(ps.Engines.Kv)
 	return snapshotResult, nil
 }
 

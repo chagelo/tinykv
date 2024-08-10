@@ -44,11 +44,13 @@ type Ready struct {
 	// The current volatile state of a Node.
 	// SoftState will be nil if there is no update.
 	// It is not required to consume or store SoftState.
+	// 与节点 state 有关，没必要持久化
 	*SoftState
 
 	// The current state of a Node to be saved to stable storage BEFORE
 	// Messages are sent.
 	// HardState will be equal to empty state if there is no update.
+	// 节点的硬状态，需要持久化
 	pb.HardState
 
 	// Entries specifies entries to be saved to stable storage BEFORE
@@ -174,26 +176,10 @@ func (rn *RawNode) Ready() Ready {
 		rn.prevHardSt = hardSt
 	}
 
-	// 应用快照，并清空
 	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
 		ready.Snapshot = *r.RaftLog.pendingSnapshot
-		r.RaftLog.pendingSnapshot = nil
 	}
-
-	r.msgs = nil
-
 	return ready
-}
-
-func (rn *RawNode) acceptReady(rd Ready) {
-	if rd.SoftState != nil {
-		rn.prevSoftSt = rd.SoftState
-	}
-
-	if !IsEmptyHardState(rd.HardState) {
-		rn.prevHardSt = rd.HardState
-	}
-
 }
 
 // - 是否有需要发送的 msg
@@ -249,14 +235,16 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	if len(rd.Entries) > 0 {
-		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries) - 1].Index
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 
 	if len(rd.CommittedEntries) > 0 {
-		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries) - 1].Index
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 
-	rn.Raft.RaftLog.maybeCompact()
+	rn.Raft.msgs = nil
+	// rn.Raft.RaftLog.maybeCompact()
+	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this

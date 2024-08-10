@@ -220,6 +220,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					if v != last {
 						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
 					}
+					// log.Infof("get correct value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
 				}
 			}
 		})

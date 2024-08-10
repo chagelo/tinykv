@@ -61,7 +61,7 @@ func testUpdateTermFromMessage(t *testing.T, state StateType) {
 		r.becomeLeader()
 	}
 
-	r.Step(pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2})
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 1, Index: 1, Entries: []*pb.Entry{{Index: 1, Term: 1}}})
 
 	if r.Term != 2 {
 		t.Errorf("term = %d, want %d", r.Term, 2)
@@ -594,7 +594,7 @@ func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 		r.becomeFollower(2, 2)
 		msgs := r.readMessages() // clear message
 
-		r.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: tt.term, Index: tt.index})
+		r.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: tt.term, Index: tt.index, Commit: 2})
 
 		msgs = r.readMessages()
 		if len(msgs) != 1 {

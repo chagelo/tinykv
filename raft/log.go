@@ -90,8 +90,21 @@ func newLog(storage Storage) *RaftLog {
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
+// discard raft log
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	remainedIndex, _ := l.storage.FirstIndex()
+	if len(l.entries) > 0 {
+		// |--raftlogentry--|
+		//                   |------storage------|
+		if remainedIndex > l.LastIndex() {
+			l.entries = nil
+			// |----raftlogentry----|
+			//           |------storage------|
+		} else if remainedIndex >= l.FirstIndex() {
+			l.entries = l.entries[remainedIndex-l.FirstIndex():]
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -109,18 +122,23 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if l.stabled >= l.LastIndex() {
+	if l.stabled+1 < l.FirstIndex() {
+		panic("Stable Index must be not less than raftlog firstIndex")
+	}
+
+	if l.stabled > l.LastIndex() {
+		panic("Stable Index must be not greater than raftlog firstIndex")
+	}
+
+	if l.stabled == l.LastIndex() {
 		return []pb.Entry{}
 	}
 
-	ents := make([]pb.Entry, 0)
+	//
+	// fisrt-------------stable-----------last
+	offset := l.stabled + 1 - l.FirstIndex()
 
-	for _, entry := range l.entries {
-		if entry.Index > l.stabled {
-			ents = append(ents, entry)
-		}
-	}
-	return ents
+	return l.entries[offset:]
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -132,9 +150,12 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if l.committed == l.applied {
 		return
 	}
-
+	// |--- apply ---|----commit---|
+	// l.appy must be greater to l.entries[0].Index
+	// otherwise there might be some entry with index < l.entries[0].Index but index > l.appy
 	offset := l.entries[0].Index
-	ents = append(ents, l.entries[l.applied-offset+1:l.committed-offset+1]...)
+	ents = append(ents, l.entries[l.applied+1-offset:l.committed+1-offset]...)
+	// TODO: compact entry with index <= l.apply
 	return
 }
 
@@ -144,55 +165,45 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) != 0 {
 		return l.entries[0].Index + uint64(len(l.entries)) - 1
 	}
-	return l.stabled
 
+	lastIndex, _ := l.storage.LastIndex()
+
+	return lastIndex
 }
 
 //  apply|commited entries|stable entries|unstable entries
 
 // Term return the term of the entry in the given index
+// check the unstable entry first
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-
-	if i+1 < l.FirstIndex() {
-		return 0, ErrCompacted
-	}
-
-	lastIndex := l.LastIndex()
-	if i > lastIndex {
-		return 0, ErrUnavailable
-	}
-
-	// 当前 entrie 不为空，
 	if len(l.entries) > 0 {
-		if i >= l.FirstIndex() {
-			index := i - l.FirstIndex()
-			if index >= uint64(len(l.entries)) {
-				return 0, ErrUnavailable
-			}
-			return l.entries[index].Term, nil
+		firstIndex := l.FirstIndex()
+		lastIndex := l.LastIndex()
+		if i >= firstIndex && i <= lastIndex {
+			return l.entries[i-firstIndex].Term, nil
 		}
 	}
 
 	term, err := l.storage.Term(i)
-	if err != nil {
-		if err == ErrUnavailable {
-			if !IsEmptySnap(l.pendingSnapshot) {
-				return l.pendingSnapshot.Metadata.Term, nil
-			}
-		}
+	if err == nil {
+		return term, nil
 	}
-
-	return term, nil
+	return 0, err
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
-	if len(l.entries) == 0 {
-		i, _ := l.storage.FirstIndex()
-		return i
+	if len(l.entries) > 0 {
+		return l.entries[0].Index
 	}
 
-	return l.entries[0].Index
+	i, _ := l.storage.FirstIndex()
+	return i
+}
+
+func (l *RaftLog) StorageFirstIndex() uint64 {
+	i, _ := l.storage.FirstIndex()
+	return i
 }
 
 func (l *RaftLog) matchTerm(idx, term uint64) bool {
@@ -249,8 +260,26 @@ func (l *RaftLog) isMoreUptoDate(candidateIndex, candidateTerm uint64) bool {
 }
 
 
-func (l *RaftLog) commitTo(tocommit uint64) {
+func (l *RaftLog) findConflictByTerm(index uint64, term uint64) (uint64, uint64) {
+	for ; index > 0; index-- {
+		// If there is an error (likely ErrCompacted or ErrUnavailable), we don't
+		// know whether it's a match or not, so assume a possible match and return
+		// the index, with 0 term indicating an unknown term.
+		if ourTerm, err := l.Term(index); err != nil {
+			return index, 0
+		} else if ourTerm <= term {
+			return index, ourTerm
+		}
+	}
+	return 0, 0
+}
+
+func (l *RaftLog) commitTo(tocommit uint64, r *Raft) {
+	// never decrease commit
 	if l.committed < tocommit {
+		if l.LastIndex() < tocommit {
+			r.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.LastIndex())
+		}
 		l.committed = tocommit
 	}
 }

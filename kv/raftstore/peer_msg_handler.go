@@ -2,14 +2,19 @@ package raftstore
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -43,12 +48,31 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	// 1. 是否当前 peer 发生了选举有关的状态变更
+	//   - Leader 变了或者 当前 peer 的 state变了
+	//   - term 变了或者进行了投票
+	// 2. 有需要应用的快照？快照怎么应用，它的哪部分数据的快照
+	// 3. 有需要发送的 mesg
+	// 4. 有需要应用的快照，raftlog 里面，applyIndex 到 commitIndex 这部分日志
+	// 5. 有需要持久化的日志，
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
 
-		d.peerStorage.SaveReadyState(&ready)
+		applySnapRes, err := d.peerStorage.SaveReadyState(&ready)
+		if err != nil {
+			return
+		}
+
+		if applySnapRes != nil {
+			if !reflect.DeepEqual(applySnapRes.Region, applySnapRes.PrevRegion) {
+				d.peerStorage.SetRegion(applySnapRes.Region)
+				// TODO: ctx?
+			}
+		}
 
 		d.Send(d.ctx.trans, ready.Messages)
+
+		d.ApplyCommitedEntries(ready.CommittedEntries)
 
 		d.RaftGroup.Advance(ready)
 	}
@@ -148,17 +172,16 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			msg.Requests = msg.Requests[1:]
 			continue
 		}
-		data, err1 := msg.Marshal()
+
+		data, err1 := req.Marshal()
 		if err1 != nil {
 			log.Panic(err)
 		}
+
 		p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
 		d.proposals = append(d.proposals, p)
 		msg.Requests = msg.Requests[1:]
 		d.RaftGroup.Propose(data)
-
-		// below just for Test
-		cb.Done(newCmdResp())
 	}
 
 }
@@ -617,4 +640,155 @@ func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, comp
 		},
 	}
 	return req
+}
+
+func (d *peerMsgHandler) ApplyCommitedEntries(commitedEntries []pb.Entry) {
+	kvWB := &engine_util.WriteBatch{}
+	for _, entry := range commitedEntries {
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+
+		if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+
+		} else {
+
+			d.ApplyCommitedEntry(&entry, kvWB)
+		}
+
+		if d.stopped {
+			return
+		}
+
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		if err != nil {
+			log.Panic(err)
+		}
+
+		// _, err = meta.GetRegionLocalState(d.peerStorage.Engines.Kv, d.peer.Region().GetId())
+		// if err != nil {
+		// 	log.Panic(err)
+		// }
+	}
+	kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+}
+
+// one entry is a raft_cmdpb.Request, as we handle in proposeRaftCommand
+func (d *peerMsgHandler) ApplyCommitedEntry(commitedEntry *pb.Entry, kvWB *engine_util.WriteBatch) {
+	req := &raft_cmdpb.Request{}
+	err := req.Unmarshal(commitedEntry.GetData())
+	if err != nil {
+		panic(err)
+	}
+	resps := []*raft_cmdpb.Response{}
+
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+
+		resps = append(resps, &raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Get,
+			Get:     &raft_cmdpb.GetResponse{Value: value},
+		})
+
+	case raft_cmdpb.CmdType_Put:
+		kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+
+		resps = append(resps, &raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Put,
+			Put:     &raft_cmdpb.PutResponse{},
+		})
+
+	case raft_cmdpb.CmdType_Delete:
+		kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+
+		resps = append(resps, &raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Delete,
+			Delete:  &raft_cmdpb.DeleteResponse{},
+		})
+
+	case raft_cmdpb.CmdType_Snap:
+		resps = append(resps, &raft_cmdpb.Response{
+			CmdType: raft_cmdpb.CmdType_Snap,
+			Snap: &raft_cmdpb.SnapResponse{
+				Region: d.Region(),
+			},
+		})
+	}
+
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+
+	d.processProposals(cmdResp, commitedEntry, req.CmdType == raft_cmdpb.CmdType_Snap)
+}
+
+func (d *peerMsgHandler) processProposals(resp *raft_cmdpb.RaftCmdResponse, entry *eraftpb.Entry, isExecSnap bool) {
+	length := len(d.proposals)
+	if length > 0 {
+		d.dropStaleProposal(entry)
+		if len(d.proposals) == 0 {
+			return
+		}
+		p := d.proposals[0]
+		if p.index > entry.Index {
+			return
+		}
+		// term 不匹配
+		if p.term != entry.Term {
+			NotifyStaleReq(entry.Term, p.cb)
+			d.proposals = d.proposals[1:]
+			return
+		}
+		// p.index == entry.Index && p.term == entry.Term， 开始执行并回应
+		if isExecSnap {
+			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 注意时序，一定要在 Done 之前完成
+		}
+		p.cb.Done(resp)
+		d.proposals = d.proposals[1:]
+		return
+	}
+}
+
+// 丢弃过时的 proposal
+// 除了在 ApplyCommitedEntries 时，还会在其他地方 append proposals
+func (d *peerMsgHandler) dropStaleProposal(entry *eraftpb.Entry) {
+	length := len(d.proposals)
+	if length > 0 {
+		first := 0
+		// 前面未回应的都说明过时了, 直接回应过时错误
+		for first < length {
+			p := d.proposals[first]
+			if p.index < entry.Index {
+				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+				first++
+			} else {
+				break
+			}
+		}
+		if first == length {
+			d.proposals = make([]*proposal, 0)
+			return
+		}
+		d.proposals = d.proposals[first:]
+	}
+}
+
+func (d *peerMsgHandler) ApplyCmdGet(commitedEntry *pb.Entry, req *raft_cmdpb.Request) {
+	value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Get,
+		Get:     &raft_cmdpb.GetResponse{Value: value},
+	}}
+
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+
+	d.processProposals(cmdResp, commitedEntry, false)
 }
