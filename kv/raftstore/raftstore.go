@@ -204,8 +204,10 @@ type Raftstore struct {
 	// 当前 store 的信息
 	ctx        *GlobalContext
 	storeState *storeState
+	// 路由一个 message 到某个 peer，一般需要一个 regionid
 	router     *router
 	workers    *workers
+	// 定时器
 	tickDriver *tickDriver
 	closeCh    chan struct{}
 	wg         *sync.WaitGroup
@@ -244,6 +246,7 @@ func (bs *Raftstore) start(
 		router:               bs.router,
 		trans:                trans,
 		schedulerTaskSender:  bs.workers.schedulerWorker.Sender(),
+		// 顾名思义，region work
 		regionTaskSender:     bs.workers.regionWorker.Sender(),
 		splitCheckTaskSender: bs.workers.splitCheckWorker.Sender(),
 		raftLogGCTaskSender:  bs.workers.raftLogGCWorker.Sender(),

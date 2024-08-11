@@ -353,15 +353,16 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		}
 	}
 
-	// func Append receive total unstable entries
-	// so, entries which has index within [entLastIndex+1, storageLastIndex]
-	// might be overwirte due to Log Replication
+	// [entLastIndex+1, storageLastIndex] is ubstable, so we delete these conflict entry
 	for index := entLastIndex + 1; index <= storageLastIndex; index++ {
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.GetId(), index))
 	}
 
-	// update RaftLocalSate
-	ps.raftState.LastIndex, ps.raftState.LastTerm = entFirstIndex, entLastTerm
+	if entLastIndex > storageLastIndex {
+		ps.raftState.LastIndex = entLastIndex
+		ps.raftState.LastTerm = entLastTerm
+	}
+
 	return nil
 }
 
@@ -452,9 +453,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 
 	// 持久化 raftlocalstate
-	if err := raftWriteBatch.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState); err != nil {
-		panic(err)
-	}
+	raftWriteBatch.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
 
 	// 避免二次调用，而 writebatch 未清空
 	raftWriteBatch.WriteToDB(ps.Engines.Raft)

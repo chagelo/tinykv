@@ -243,7 +243,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 
 	rn.Raft.msgs = nil
-	// rn.Raft.RaftLog.maybeCompact()
+	rn.Raft.RaftLog.maybeCompact()
 	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 

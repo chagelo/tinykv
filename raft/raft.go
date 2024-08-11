@@ -596,7 +596,6 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		return nil
 	}
-
 	err := r.step(r, m)
 	return err
 }
@@ -915,7 +914,6 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	if meta.Index+1 < r.RaftLog.FirstIndex() {
 		r.logger.Panicf("[Peer %d term: %d], receive %s message from %x [term: %d] snapshot lastIndex + 1 < raftlog firstIndex", r.id, r.Term, m.MsgType, m.From, m.Term)
 	}
-
 	r.Lead = m.From
 	r.RaftLog.applied = m.Snapshot.Metadata.Index
 	r.RaftLog.committed = m.Snapshot.Metadata.Index
@@ -929,7 +927,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	// |------- entry -------|
 	//|---- snapshot ----|
 	if len(r.RaftLog.entries) > 0 {
-		if meta.Index > r.RaftLog.LastIndex() {
+		if meta.Index >= r.RaftLog.LastIndex() {
 			r.RaftLog.entries = nil
 		} else if meta.Index >= r.RaftLog.FirstIndex() {
 			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.FirstIndex():]

@@ -122,23 +122,17 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if l.stabled+1 < l.FirstIndex() {
-		panic("Stable Index must be not less than raftlog firstIndex")
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		if l.stabled < firstIndex {
+			return l.entries
+		}
+		if l.stabled-firstIndex >= uint64(len(l.entries)-1) {
+			return make([]pb.Entry, 0)
+		}
+		return l.entries[l.stabled-firstIndex+1:]
 	}
-
-	if l.stabled > l.LastIndex() {
-		panic("Stable Index must be not greater than raftlog firstIndex")
-	}
-
-	if l.stabled == l.LastIndex() {
-		return []pb.Entry{}
-	}
-
-	//
-	// fisrt-------------stable-----------last
-	offset := l.stabled + 1 - l.FirstIndex()
-
-	return l.entries[offset:]
+	return make([]pb.Entry, 0)
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -258,7 +252,6 @@ func (l *RaftLog) isMoreUptoDate(candidateIndex, candidateTerm uint64) bool {
 	}
 	return candidateIndex >= lastIndex
 }
-
 
 func (l *RaftLog) findConflictByTerm(index uint64, term uint64) (uint64, uint64) {
 	for ; index > 0; index-- {
