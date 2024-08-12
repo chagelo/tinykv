@@ -17,10 +17,13 @@ package raft
 import (
 	"crypto/rand"
 	"errors"
+
+	// "fmt"
 	"math/big"
 	"sort"
 	"sync"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -353,7 +356,7 @@ func (r *Raft) bcastHeartbeat() {
 			To:   peer,
 			Term: r.Term,
 
-			Commit: r.RaftLog.committed,
+			Commit: util.RaftInvalidIndex,
 
 			MsgType: pb.MessageType_MsgHeartbeat,
 		})
@@ -385,6 +388,7 @@ func (r *Raft) reset(term uint64) {
 
 	r.Term = term
 	r.Lead = None
+	r.leadTransferee = None
 
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
@@ -470,6 +474,12 @@ func stepFollower(r *Raft, m pb.Message) error {
 	case pb.MessageType_MsgHup:
 		r.startElection()
 
+	case pb.MessageType_MsgPropose:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+
 	case pb.MessageType_MsgAppend:
 		r.Lead = m.From
 		r.electionElapsed = 0
@@ -487,7 +497,18 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleSnapshot(m)
+
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+
+	case pb.MessageType_MsgTimeoutNow:
+		r.electionElapsed = 0
+		r.startElection()
 	}
+
 	return nil
 }
 
@@ -509,7 +530,18 @@ func stepCandidate(r *Raft, m pb.Message) error {
 
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVoteResponse(m)
+
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+
+	case pb.MessageType_MsgTimeoutNow:
+		r.electionElapsed = 0
+		r.startElection()
 	}
+
 	return nil
 }
 
@@ -527,7 +559,7 @@ func stepLeader(r *Raft, m pb.Message) error {
 		// If we are not currently a member of the range (i.e. this node
 		// was removed from the configuration while serving as leader),
 		// drop any new proposals.
-		if r.Prs[r.id] == nil {
+		if r.Prs[r.id] == nil || r.leadTransferee != None {
 			return ErrProposalDropped
 		}
 
@@ -547,6 +579,9 @@ func stepLeader(r *Raft, m pb.Message) error {
 			Reject:  true,
 			MsgType: pb.MessageType_MsgRequestVoteResponse,
 		})
+
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 	return nil
 }
@@ -555,6 +590,7 @@ func stepLeader(r *Raft, m pb.Message) error {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	// fmt.Println(r.id, r.Lead, m.From, m.To, m.MsgType)
 	switch {
 	case m.Term == 0:
 		// local message
@@ -608,6 +644,11 @@ func (r *Raft) startElection() {
 		return
 	}
 
+	// current node might be remove from current raft group
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+
 	r.becomeCandidate()
 
 	if len(r.Prs) == 1 {
@@ -633,6 +674,32 @@ func (r *Raft) startElection() {
 			LogTerm: lastTerm,
 			MsgType: pb.MessageType_MsgRequestVote,
 		})
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// maybe the target node is not in the current raft group
+
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+
+	if m.From == r.id {
+		return
+	}
+
+	// current node is r.id && r.state == StateLeader
+
+	r.leadTransferee = m.From
+
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			MsgType: pb.MessageType_MsgTimeoutNow,
+		})
+	} else {
+		r.sendAppend(m.From)
 	}
 }
 
@@ -768,7 +835,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		for _, entry := range m.Entries {
 			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		}
-		lastIndex := m.Entries[len(m.Entries)-1].Index
+		lastIndex := None
+		if len(m.Entries) > 0 {
+			lastIndex = m.Entries[len(m.Entries)-1].Index
+		} else {
+			lastIndex = m.Index
+		}
+
 		r.msgs = append(r.msgs, pb.Message{
 			From:    r.id,
 			To:      m.From,
@@ -832,37 +905,14 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		r.Prs[m.From].Match = m.Index
 		r.Prs[m.From].Next = m.Index + 1
 
-		matchInts := make([]uint64, 0)
+		r.maybeCommit()
 
-		for id, p := range r.Prs {
-			if id == r.id {
-				continue
-			}
-			matchInts = append(matchInts, p.Match)
-		}
-
-		sort.Slice(matchInts, func(i, j int) bool {
-			return matchInts[i] < matchInts[j]
-		})
-
-		// desc order,
-		// [1, 2, 3, 4, cur], 4 -> 3 -> 2
-		// [1, 2, 3, cur] 3 -> 2 -> 1
-
-		// 具有当前日志的 term 被写到大多数节点
-		if r.RaftLog.maybeCommit(matchInts[len(matchInts)/2], r.Term) {
-			// once a follower learns that a log entry is committed,
-			// it applies the entry to its local state machine (in log order).
-			// Reference: section 5.3
-			// FIXME:r.RaftLog.storage.apply
-
-			if r.RaftLog.committed > r.Prs[r.id].Match {
-				r.Prs[r.id].Match = r.RaftLog.committed
-				r.Prs[r.id].Next = r.RaftLog.committed + 1
-			}
-
-			// it's necessary to broadcast to everyone else
-			r.bcastAppend()
+		if r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+			r.msgs = append(r.msgs, pb.Message{
+				From:    r.id,
+				To:      m.From,
+				MsgType: pb.MessageType_MsgTimeoutNow,
+			})
 		}
 	}
 }
@@ -952,11 +1002,29 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
+		r.PendingConfIndex = None
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	log.Infof("[Peer %d term: %d] remove the current node from the group\n", r.id, r.Term)
+
+	if _, ok := r.Prs[id]; !ok {
+		return
+	}
+
+	delete(r.Prs, id)
+
+	// 由于删除了一个节点，导致可以更新 comimitIndex
+	if r.State == StateLeader {
+		r.maybeCommit()
+	}
+
+	r.PendingConfIndex = None
 }
 
 // current peer is candidate or follower
@@ -987,6 +1055,7 @@ func (r *Raft) heartbeatTiker() {
 		return
 	}
 
+	// 解决孤岛的问题：if r.heartbeatElapsed >= r.heartbeatTimeout && r.heartbeatElapsed % r.heartbeatTimeout == 0
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
 		if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat, From: r.id, To: r.id}); err != nil {
@@ -994,4 +1063,39 @@ func (r *Raft) heartbeatTiker() {
 		}
 	}
 
+}
+
+func (r *Raft) maybeCommit() {
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = max(r.RaftLog.committed, r.RaftLog.LastIndex())
+		return
+	}
+
+	matchInts := make([]uint64, 0)
+
+	for id, p := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		matchInts = append(matchInts, p.Match)
+	}
+
+	sort.Slice(matchInts, func(i, j int) bool {
+		return matchInts[i] < matchInts[j]
+	})
+
+	// desc order,
+	// [1, 2, 3, 4, cur], 4 -> 3 -> 2
+	// [1, 2, 3, cur] 3 -> 2 -> 1
+
+	// 具有当前日志的 term 被写到大多数节点
+	if r.RaftLog.maybeCommit(matchInts[len(matchInts)/2], r.Term) {
+		// once a follower learns that a log entry is committed,
+		// it applies the entry to its local state machine (in log order).
+		// Reference: section 5.3
+		// FIXME:r.RaftLog.storage.apply
+
+		// it's necessary to broadcast to everyone else
+		r.bcastAppend()
+	}
 }
