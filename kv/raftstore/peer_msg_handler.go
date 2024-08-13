@@ -268,6 +268,23 @@ func (d *peerMsgHandler) proposeAdminCommand(msg *raft_cmdpb.RaftCmdRequest, cb 
 			cb.Done(ErrResp(err))
 			return
 		}
+
+	case raft_cmdpb.AdminCmdType_Split:
+		err := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, d.Region())
+		if err != nil {
+			cb.Done(ErrResp(err))
+		}
+
+		data, err := msg.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			log.Panic(err)
+			return
+		}
+
+		p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+		d.proposals = append(d.proposals, p)
+		d.RaftGroup.Propose(data)
 	}
 }
 
@@ -792,7 +809,20 @@ func (d *peerMsgHandler) ApplyConfChangeEntry(commitedEntry *pb.Entry, kvWB *eng
 			// peercache
 			d.insertPeerCache(req.AdminRequest.ChangePeer.Peer)
 		}
+
 	case eraftpb.ConfChangeType_RemoveNode:
+		// special case
+		// when left two node, remove one,
+		// in this case we should transfer leader
+		if len(d.Region().Peers) == 2 && confchange.NodeId == req.AdminRequest.ChangePeer.Peer.Id {
+			for _, p := range d.Region().Peers {
+				if p.Id != req.AdminRequest.ChangePeer.Peer.Id {
+					d.RaftGroup.TransferLeader(p.Id)
+					break
+				}
+			}
+		}
+
 		if confchange.NodeId == d.PeerId() {
 			if d.MaybeDestroy() {
 				kvWB.DeleteMeta(meta.ApplyStateKey(d.regionId))
@@ -865,10 +895,109 @@ func (d *peerMsgHandler) ApplyCommitedEntry(commitedEntry *pb.Entry, kvWB *engin
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			d.handleCompact(rq, commitedEntry, kvWB)
 		case raft_cmdpb.AdminCmdType_Split:
-
+			d.handleSplit(req, rq, commitedEntry, kvWB)
 		}
 
 	}
+}
+
+func (d *peerMsgHandler) handleSplit(req *raft_cmdpb.RaftCmdRequest, rq *raft_cmdpb.AdminRequest, entry *pb.Entry, kvWB *engine_util.WriteBatch) {
+	fmt.Println(req.Header.RegionId, rq.Split.NewRegionId)
+
+	// Header.RegionId 是 new region id?
+	if req.Header.RegionId != d.regionId {
+		resp := ErrResp(&util.ErrRegionNotFound{RegionId: req.Header.RegionId})
+		d.processProposals(resp, entry, false)
+		return
+	}
+
+	// 检测距离 client 发送命令时，这段时间内集群变更有没有配置改变
+	// 过期
+	err := util.CheckRegionEpoch(req, d.Region(), true)
+	if err != nil {
+		resp := ErrResp(err)
+		d.processProposals(resp, entry, false)
+		return
+	}
+
+	// splitkey 是不是在当前 region 里面
+	err = util.CheckKeyInRegion(rq.Split.SplitKey, d.Region())
+	if err != nil {
+		resp := ErrResp(err)
+		d.processProposals(resp, entry, false)
+		return
+	}
+
+	// 
+	if len(rq.Split.NewPeerIds) != len(d.Region().Peers) {
+		resp := ErrRespStaleCommand(req.Header.Term)
+		d.processProposals(resp, entry, false)
+		return
+	}
+
+	log.Infof("Region %d peer %d begin to split", d.regionId, d.PeerId())
+
+	newPeers := make([]*metapb.Peer, 0)
+	for i, pr := range d.Region().Peers {
+		newPeers = append(newPeers, &metapb.Peer{
+			Id:      rq.Split.NewPeerIds[i],
+			StoreId: pr.StoreId,
+		})
+	}
+
+	newRegion := &metapb.Region{
+		Id:       rq.Split.NewRegionId,
+		StartKey: rq.Split.SplitKey,
+		EndKey:   d.Region().EndKey,
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: 0,
+			Version: 0,
+		},
+		Peers: newPeers,
+	}
+
+	d.ctx.storeMeta.Lock()
+	d.Region().RegionEpoch.Version++
+	newRegion.RegionEpoch.Version++
+	d.Region().EndKey = rq.Split.SplitKey
+	d.ctx.storeMeta.regions[rq.Split.NewRegionId] = newRegion
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+	d.ctx.storeMeta.Unlock()
+
+	// newPeers 只包含 peerid 和 peer 属于哪个 store
+	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	newPeer.peerStorage.SetRegion(newRegion)
+	d.ctx.router.register(newPeer)
+	startMsg := message.Msg{
+		RegionID: rq.Split.NewRegionId,
+		Type:     message.MsgTypeStart,
+	}
+	err = d.ctx.router.send(rq.Split.NewRegionId, startMsg)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType: raft_cmdpb.AdminCmdType_Split,
+			Split: &raft_cmdpb.SplitResponse{
+				Regions: []*metapb.Region{newRegion, d.Region()},
+			},
+		},
+	}
+
+	d.processProposals(resp, entry, false)
+
+	d.notifyHeartbeatScheduler(d.Region(), d.peer)
+	d.notifyHeartbeatScheduler(newRegion, newPeer)
 }
 
 func (d *peerMsgHandler) handleCompact(rq *raft_cmdpb.AdminRequest, commitedEntry *pb.Entry, kvWB *engine_util.WriteBatch) {
