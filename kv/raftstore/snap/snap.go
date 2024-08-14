@@ -582,6 +582,7 @@ func (s *Snap) Exists() bool {
 	return util.FileExists(s.MetaFile.Path)
 }
 
+// delete datafile, delete metafile
 func (s *Snap) Delete() {
 	log.Debugf("deleting %s", s.Path())
 	for _, cfFile := range s.CFFiles {

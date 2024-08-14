@@ -76,6 +76,7 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	// both are raftlocal state
 	prevSoftSt *SoftState
 	prevHardSt pb.HardState
 }

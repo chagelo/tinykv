@@ -182,7 +182,9 @@ func (rs *RaftStorage) Start() error {
 	rs.raftRouter, rs.raftSystem = raftstore.CreateRaftstore(cfg)
 
 	rs.resolveWorker = worker.NewWorker("resolver", &rs.wg)
+	// 得到接受的 channel
 	resolveSender := rs.resolveWorker.Sender()
+	// resolveRunner 保存 schedulerClient 以及 storeId 到 store 地址的映射
 	resolveRunner := newResolverRunner(schedulerClient)
 	rs.resolveWorker.Start(resolveRunner)
 
@@ -192,6 +194,9 @@ func (rs *RaftStorage) Start() error {
 	snapRunner := newSnapRunner(rs.snapManager, rs.config, rs.raftRouter)
 	rs.snapWorker.Start(snapRunner)
 
+	// raftclient create two map
+	// one 	   [storeid -> addr]
+	// another [addr -> conn]
 	raftClient := newRaftClient(cfg)
 	trans := NewServerTransport(raftClient, snapSender, rs.raftRouter, resolveSender)
 

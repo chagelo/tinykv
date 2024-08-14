@@ -26,6 +26,7 @@ func NewServerTransport(raftClient *RaftClient, snapScheduler chan<- worker.Task
 	}
 }
 
+// route msg to the target
 func (t *ServerTransport) Send(msg *raft_serverpb.RaftMessage) error {
 	storeID := msg.GetToPeer().GetStoreId()
 	t.SendStore(storeID, msg)

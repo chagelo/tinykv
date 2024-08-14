@@ -57,6 +57,7 @@ func (pr *router) close(regionID uint64) {
 	}
 }
 
+// 发送到当前 store 的某个 region?
 func (pr *router) send(regionID uint64, msg message.Msg) error {
 	msg.RegionID = regionID
 	p := pr.get(regionID)
@@ -67,6 +68,7 @@ func (pr *router) send(regionID uint64, msg message.Msg) error {
 	return nil
 }
 
+// msg 塞给 storeSender
 func (pr *router) sendStore(msg message.Msg) {
 	pr.storeSender <- msg
 }
@@ -81,12 +83,14 @@ func NewRaftstoreRouter(router *router) *RaftstoreRouter {
 	return &RaftstoreRouter{router: router}
 }
 
+// // 发送到当前 store 的某个 region?
 func (r *RaftstoreRouter) Send(regionID uint64, msg message.Msg) error {
 	return r.router.send(regionID, msg)
 }
 
 func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error {
 	regionID := msg.RegionId
+	// 先发送到当前 store 的某个 region，如果 region 不存在那么发给 storesender
 	if r.router.send(regionID, message.NewPeerMsg(message.MsgTypeRaftMessage, regionID, msg)) != nil {
 		r.router.sendStore(message.NewPeerMsg(message.MsgTypeStoreRaftMessage, regionID, msg))
 	}

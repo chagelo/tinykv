@@ -609,6 +609,9 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.proposeRaftCommand(request, nil)
 }
 
+// check whether or not to split, if yes, send splittask to splitworker's receiver
+// then drive splitworker to handle splittask, and then generate a splitregion command
+// to raftworker module to handle splitregion command
 func (d *peerMsgHandler) onSplitRegionCheckTick() {
 	d.ticker.schedule(PeerTickSplitRegionCheck)
 	// To avoid frequent scan, we only add new scan tasks if all previous tasks

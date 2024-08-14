@@ -24,6 +24,8 @@ func newSnapBuilder(cfFiles []*CFFile, dbSnap *badger.Txn, region *metapb.Region
 	}
 }
 
+// read key value from memory?(not sure) then write to desk as sstwrite wrapped with
+// some sign a
 func (b *snapBuilder) build() error {
 	defer b.txn.Discard()
 	startKey, endKey := b.region.StartKey, b.region.EndKey

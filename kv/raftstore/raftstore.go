@@ -104,8 +104,9 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
+// loadPeers load each region state from current store region state from storage kvEngine
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey
@@ -205,8 +206,8 @@ type Raftstore struct {
 	ctx        *GlobalContext
 	storeState *storeState
 	// 路由一个 message 到某个 peer，一般需要一个 regionid
-	router     *router
-	workers    *workers
+	router  *router
+	workers *workers
 	// 定时器
 	tickDriver *tickDriver
 	closeCh    chan struct{}
@@ -229,7 +230,9 @@ func (bs *Raftstore) start(
 	if err != nil {
 		return err
 	}
+
 	wg := new(sync.WaitGroup)
+	// 每个 worker 里有一个 channel
 	bs.workers = &workers{
 		splitCheckWorker: worker.NewWorker("split-check", wg),
 		regionWorker:     worker.NewWorker("snapshot-worker", wg),
@@ -237,15 +240,16 @@ func (bs *Raftstore) start(
 		schedulerWorker:  worker.NewWorker("scheduler-worker", wg),
 		wg:               wg,
 	}
+
 	bs.ctx = &GlobalContext{
-		cfg:                  cfg,
-		engine:               engines,
-		store:                meta,
-		storeMeta:            newStoreMeta(),
-		snapMgr:              snapMgr,
-		router:               bs.router,
-		trans:                trans,
-		schedulerTaskSender:  bs.workers.schedulerWorker.Sender(),
+		cfg:                 cfg,
+		engine:              engines,
+		store:               meta,
+		storeMeta:           newStoreMeta(),
+		snapMgr:             snapMgr,
+		router:              bs.router,
+		trans:               trans,
+		schedulerTaskSender: bs.workers.schedulerWorker.Sender(),
 		// 顾名思义，region work
 		regionTaskSender:     bs.workers.regionWorker.Sender(),
 		splitCheckTaskSender: bs.workers.splitCheckWorker.Sender(),
@@ -253,11 +257,13 @@ func (bs *Raftstore) start(
 		schedulerClient:      schedulerClient,
 		tickDriverSender:     bs.tickDriver.newRegionCh,
 	}
+
 	regionPeers, err := bs.loadPeers()
 	if err != nil {
 		return err
 	}
 
+	// router contain map: [regionid -> {closed, *peer}]
 	for _, peer := range regionPeers {
 		bs.router.register(peer)
 	}
@@ -268,9 +274,11 @@ func (bs *Raftstore) start(
 func (bs *Raftstore) startWorkers(peers []*peer) {
 	ctx := bs.ctx
 	workers := bs.workers
+	// router route msg, contain map: [regionid -> {closed, *peer}]
 	router := bs.router
 	bs.wg.Add(2) // raftWorker, storeWorker
 	rw := newRaftWorker(ctx, router)
+	// 当 bs.closeCh 接收到 msg 后，run 函数，for select 直接返回
 	go rw.run(bs.closeCh, bs.wg)
 	sw := newStoreWorker(ctx, bs.storeState)
 	go sw.run(bs.closeCh, bs.wg)
@@ -283,6 +291,8 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	}
 	engines := ctx.engine
 	cfg := ctx.cfg
+	// 下面四个 worker 的 receiver 类型均为 task
+	// splitCheckWorker 当 receiver 收到一个 task（之前触发 regionsplit 的阈值了），驱动向下发送一个 split msg
 	workers.splitCheckWorker.Start(runner.NewSplitCheckHandler(engines.Kv, NewRaftstoreRouter(router), cfg))
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
@@ -307,7 +317,10 @@ func (bs *Raftstore) shutDown() {
 }
 
 func CreateRaftstore(cfg *config.Config) (*RaftstoreRouter, *Raftstore) {
+	// storeSender 是 receiver 转换成了 sender，作为返回值用来发送 msg，storeState 是和 tick 有关的
 	storeSender, storeState := newStoreState(cfg)
+	// router 接受 storeSender 来发送消息
+	// 包含 map: [regionid -> {closed, *peer}]
 	router := newRouter(storeSender)
 	raftstore := &Raftstore{
 		router:     router,

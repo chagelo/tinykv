@@ -21,6 +21,7 @@ type raftConn struct {
 }
 
 func newRaftConn(addr string, cfg *config.Config) (*raftConn, error) {
+	// 基于 grpc 创建一个到 addr 的连接
 	cc, err := grpc.Dial(addr, grpc.WithInsecure(),
 		grpc.WithInitialWindowSize(2*1024*1024),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -77,6 +78,8 @@ func (c *RaftClient) getConn(addr string, regionID uint64) (*raftConn, error) {
 		return conn, nil
 	}
 	c.RUnlock()
+
+	// 创建到 addr 的客户端连接，并保存到 conns 中
 	newConn, err := newRaftConn(addr, c.config)
 	if err != nil {
 		return nil, err
@@ -91,6 +94,7 @@ func (c *RaftClient) getConn(addr string, regionID uint64) (*raftConn, error) {
 	return newConn, nil
 }
 
+// mesg 发送到
 func (c *RaftClient) Send(storeID uint64, addr string, msg *raft_serverpb.RaftMessage) error {
 	conn, err := c.getConn(addr, msg.GetRegionId())
 	if err != nil {
@@ -101,17 +105,21 @@ func (c *RaftClient) Send(storeID uint64, addr string, msg *raft_serverpb.RaftMe
 		return nil
 	}
 
+	// if there is some error
+	// stop connection, delete some info
 	log.Error("raft client failed to send")
 	c.Lock()
 	defer c.Unlock()
 	conn.Stop()
 	delete(c.conns, addr)
+	// delete storeid -> addr
 	if oldAddr, ok := c.addrs[storeID]; ok && oldAddr == addr {
 		delete(c.addrs, storeID)
 	}
 	return err
 }
 
+// get addr according storeid
 func (c *RaftClient) GetAddr(storeID uint64) string {
 	c.RLock()
 	defer c.RUnlock()
@@ -119,6 +127,7 @@ func (c *RaftClient) GetAddr(storeID uint64) string {
 	return v
 }
 
+// insert storeid -> addr
 func (c *RaftClient) InsertAddr(storeID uint64, addr string) {
 	c.Lock()
 	defer c.Unlock()
