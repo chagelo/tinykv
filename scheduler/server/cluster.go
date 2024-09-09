@@ -67,7 +67,7 @@ type RaftCluster struct {
 	id      id.Allocator
 
 	prepareChecker *prepareChecker
-
+	// coordinator is used to manage all schedulers and checkers to decide if the region needs to be scheduled.
 	coordinator *coordinator
 
 	wg   sync.WaitGroup

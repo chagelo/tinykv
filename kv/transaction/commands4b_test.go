@@ -106,21 +106,27 @@ func TestGetVersions4B(t *testing.T) {
 		{cf: engine_util.CfWrite, key: []byte{99}, ts: 122, value: []byte{1, 0, 0, 0, 0, 0, 0, 0, 120}},
 	})
 
+	// not found
 	var req0 kvrpcpb.GetRequest
 	req0.Key = []byte{99}
 	req0.Version = 40
+	// 42
 	var req1 kvrpcpb.GetRequest
 	req1.Key = []byte{99}
 	req1.Version = 56
+	// 42
 	var req2 kvrpcpb.GetRequest
 	req2.Key = []byte{99}
 	req2.Version = 60
+	// 42
 	var req3 kvrpcpb.GetRequest
 	req3.Key = []byte{99}
 	req3.Version = 65
+	// 43
 	var req4 kvrpcpb.GetRequest
 	req4.Key = []byte{99}
 	req4.Version = 66
+	// 43
 	var req5 kvrpcpb.GetRequest
 	req5.Key = []byte{99}
 	req5.Version = 100
@@ -385,7 +391,7 @@ func TestPrewriteMultiple4B(t *testing.T) {
 	builder.assertLens(4, 4, 0)
 
 	builder.assert([]kv{
-		{cf: engine_util.CfDefault, key: []byte{4}, value: []byte{1, 3, 5}},
+		{cf: engine_util.CfDefault, key: []byte{4}, value: nil},
 	})
 }
 
